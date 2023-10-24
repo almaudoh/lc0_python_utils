@@ -1,31 +1,28 @@
+#!/opt/homebrew/Caskroom/miniforge/base/bin/python
 import argparse
-import sys
 import numpy as np
 import yaml
 import tensorflow as tf
 
-import importlib.util
 from os.path import dirname, join, abspath
+from utils import tfprocess, data_from_fen, print_as_table, softmax, print_layers, print_weights, load_tensor_from_file
 
 
-def module_from_file(module_name, base_path, rel_path):
-    file_path = join(base_path, rel_path)
-    spec = importlib.util.spec_from_file_location(module_name, file_path)
-    module = importlib.util.module_from_spec(spec)
-    sys.path.append(dirname(file_path))
-    spec.loader.exec_module(module)
-    return module
-
-
-basepath = dirname(dirname(abspath(__file__)))
-
-tfprocess = module_from_file("tfprocess", basepath, "lczero-training/tf/tfprocess.py")
-leelaBoard = module_from_file("lcztools", basepath, "lczero_tools/src/lcztools/_leela_board.py")
-
+allowed_heads = [
+    'policy', 'policy_optimistic_st', 'policy_soft',
+    'value_winner', 'value_q', 'value_q_err', 'value_st', 'value_st_err',
+    'moves_left', 'attn_wts',
+]
 argparser = argparse.ArgumentParser(description='Run net or checkpoint in tensorflow.')
-argparser.add_argument('net',
+argparser.add_argument('--net',
                        type=str,
-                       help='Net file to be converted to a model checkpoint.')
+                       required=False,
+                       help='Net file to be converted to a model and run.')
+argparser.add_argument('--heads',
+                       type=str,
+                       required=False,
+                       default='policy',
+                       help=f"Output head to print. Comma-separated list of any of {allowed_heads}")
 argparser.add_argument('--cfg',
                        type=argparse.FileType('r'),
                        required=True,
@@ -51,52 +48,33 @@ argparser.add_argument('--weight',
 argparser.add_argument('--compare',
                        type=argparse.FileType('r'),
                        help='Compare the weight or layer tensor with tensor in this file.')
+argparser.add_argument('--maxlen',
+                       type=int,
+                       required=False,
+                       default=10000,
+                       help='Maximum length of records to display. Used with "layer"')
+argparser.add_argument('--dumpconfig',
+                       type=bool,
+                       required=False,
+                       default=False,
+                       help='Whether to dump the configuration file or not')
 args = argparser.parse_args()
 cfg = yaml.safe_load(args.cfg.read())
-print(yaml.dump(cfg, default_flow_style=False))
+if args.dumpconfig:
+    print(yaml.dump(cfg, default_flow_style=False))
 
 tfp = tfprocess.TFProcess(cfg)
 tfp.init_net()
+
+if args.net:
+    tfp.replace_weights(args.net)
+else:
+    tfp.restore()
 # tfp.l2reg = tf.keras.regularizers.l2(l=0.5 * (0.0001))
 # input_var = tf.keras.Input(shape=(112, 8, 8))
 # outputs = tfp.construct_net(input_var)
 # tfp.model = tf.keras.Model(inputs=input_var, outputs=outputs)
-tfp.replace_weights(args.net)
-
-
-def data_from_fen(fen):
-    board = leelaBoard.LeelaBoard(fen)
-    # board.push_uci('e2e4')
-    print(board)
-    return np.reshape(board.lcz_features(), [-1, 112, 8, 8])
-
-
-def print_as_table(tensor, items):
-    i = 0
-    for num in tensor.flatten():
-        print('{};{}'.format(i, num))
-        i += 1
-        if i >= items:
-            break
-
-
-def print_layers(fro, to, filter=None):
-    for i in range(max(fro, 0), min(to, len(tfp.model.layers))):
-        if filter is None or filter == 'all' or filter in tfp.model.layers[i].name:
-            print('layer', i, tfp.model.layers[i].name, type(tfp.model.layers[i]), tfp.model.layers[i].output.shape)
-
-
-def print_weights(filter=None):
-    i = 0
-    for weight in tfp.model.weights:
-        if filter is None or filter == 'all' or filter in weight.name:
-            print('weight', i, weight.name, weight.shape)
-        i += 1
-
-
-def softmax(array):
-    return np.exp(array) / np.sum(np.exp(array))
-
+# tfp.replace_weights(args.net)
 
 # Run model
 x = data_from_fen(args.fen)
@@ -104,37 +82,42 @@ x = data_from_fen(args.fen)
 # Get intermediate value
 current_layer = args.layer
 
-if (current_layer == -1 or current_layer is None) and not args.show_layers \
-        and not args.layer and not args.show_weights and not args.weight:
+if (current_layer == -1 or current_layer is None) and args.show_layers is None \
+        and args.layer is None and args.show_weights is None and args.weight is None:
     outputs = tfp.model(x, training=False)
     # print('layer', tfp.model.layers[0])
     # print('outputs', outputs)
     # tf.print(outputs, output_stream=sys.stderr)
     # print('outputs.data', outputs.data)
-    # Policy
-    print_as_table(outputs[0].numpy(), 1858)
-    print_as_table(softmax(outputs[1].numpy()), 3)
-    if len(outputs) > 2:
-        print_as_table(outputs[2].numpy(), 1)
+    # Heads
+    for head in args.heads.split(','):
+        if head not in allowed_heads:
+            raise Exception(f"Cannot find specified head '{head}'. Allowed heads {allowed_heads}")
+        output = outputs[head].numpy()
+        if 'value' in head and 'err' not in head:
+            output = softmax(output)
+        print(f'{head} head')
+        print_as_table(output, min(args.maxlen, output.flatten().shape[0]))
+        print('\n')
+
     # print('policy', policy)
     # print('value', value)
     # print('moves_left', moves_left)
 
 if args.show_layers:
-    print_layers(0, len(tfp.model.layers), filter=args.show_layers)
+    print_layers(tfp.model, 0, len(tfp.model.layers), filter=args.show_layers)
 
 if current_layer != -1 and current_layer is not None:
     model = tf.keras.Model(tfp.model.input, tfp.model.layers[current_layer].output)
     outputs = model(x, training=False)
     print('layers', len(tfp.model.layers))
     print('current layer', current_layer, outputs.shape, tfp.model.layers[current_layer].name)
-    print_layers(current_layer - 12, current_layer + 12)
+    print_layers(tfp.model, current_layer - 12, current_layer + 12)
 
-    # print_as_table(outputs[0].numpy(), 8 * 8)
-    width = max(tfp.embedding_size, tfp.net.filters(), tfp.embedding_size, tfp.encoder_dff, tfp.pol_encoder_dff)
-    print_as_table(outputs.numpy(), width * 8 * 8)
+    width = max(tfp.embedding_size, tfp.net.filters(), tfp.encoder_dff)  # , tfp.pol_encoder_dff)
+    print_as_table(outputs.numpy(), min(args.maxlen, width * 8 * 8))
 
-if args.weight and not args.compare:
+if args.weight is not None and not args.compare:
     weight = tfp.model.weights[args.weight]
     # print(weight.shape, weight.numpy().transpose())
     i = 0
@@ -144,39 +127,14 @@ if args.weight and not args.compare:
         i += 1
         # if i >= items:
         #     break
-    # print_as_table(weight, 1200)
+    # print_as_table(weight, min(args.maxlen, 1200))
 
 if args.show_weights:
-    print_weights(args.show_weights)
+    print_weights(tfp.model, args.show_weights)
 
 
-def load_tensor_from_file(filename):
-    print(filename)
-    tensor = np.genfromtxt(filename,
-                           delimiter=';',
-                           comments='#',
-                           usecols=(1,),
-                           dtype=np.float32)
-    shape = tensor.shape
-
-    # anotated shape
-    with open(filename, 'r') as file:
-        shapeline = file.readline()
-        print('shapeline', shapeline.strip()[1:])
-
-        if shapeline[0] == '#':
-            exec(shapeline[1:].strip())
-            exec ('shape = (192, 1034)')
-            print('shape', shape)
-
-            exec('print(\'execing\')')
-            tensor.shape = shape
-
-    return tensor
-
-
-if (args.weight or args.layer) and args.compare:
-    if args.weight:
+if (args.weight is not None or args.layer is not None) and args.compare:
+    if args.weight is not None:
         # Leela's weights are transposed in the model.
         tensor = np.transpose(tfp.model.weights[args.weight])
     else:
